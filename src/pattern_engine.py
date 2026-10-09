@@ -1165,6 +1165,633 @@ class SpatialRelationSolver(BaseSolver):
         return g
 
 
+
+
+# ──────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────
+# TARGETED PATTERN SOLVERS
+# ──────────────────────────────────────────────────────────────────
+
+
+class RigidBodyAttractionSolver(BaseSolver):
+    """
+    Identifies a mobile object (mover) and a stationary target object (attractor).
+    Slides the mover as a rigid body along a cardinal direction until it is
+    immediately adjacent to the attractor.
+    The direction is computed DYNAMICALLY per apply() call from mover→attractor
+    centroid vector, so it handles tasks where direction varies across instances.
+    learn() only validates that such mover/attractor roles are consistent across
+    all training pairs.
+    """
+    name = "RigidBodyAttractionSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._mover_color   = None
+        self._attract_color = None
+
+    @staticmethod
+    def _cells_of_color(grid, color):
+        R, C = shape(grid)
+        return [(r, c) for r in range(R) for c in range(C) if grid[r][c] == color]
+
+    @staticmethod
+    def _centroid(cells):
+        return (sum(r for r, _ in cells) / len(cells),
+                sum(c for _, c in cells) / len(cells))
+
+    @staticmethod
+    def _direction_from_delta(dr_raw, dc_raw):
+        """Convert centroid delta to cardinal direction (dr, dc) ∈ {(0,1),(0,-1),(1,0),(-1,0)}."""
+        if abs(dr_raw) >= abs(dc_raw):
+            return (1 if dr_raw > 0 else -1, 0)
+        else:
+            return (0, 1 if dc_raw > 0 else -1)
+
+    @staticmethod
+    def _slide_until_adjacent(mover_cells, attract_cells, dr, dc, R, C):
+        """Slide mover by (dr,dc) steps until min Manhattan distance to attractor == 1."""
+        cells = list(mover_cells)
+        att_set = set(attract_cells)
+        for _ in range(max(R, C) * 2):
+            nxt = [(r + dr, c + dc) for r, c in cells]
+            if any(r < 0 or r >= R or c < 0 or c >= C for r, c in nxt):
+                break
+            if set(nxt) & att_set:
+                break
+            min_d = min(abs(r1 - r2) + abs(c1 - c2)
+                        for r1, c1 in nxt for r2, c2 in att_set)
+            if min_d < 1:
+                break
+            cells = nxt
+            if min_d == 1:
+                break
+        return cells
+
+    def learn(self, train_pairs):
+        # Identify which color is the mover (changes position) and which is the
+        # attractor (stays put), and validate consistency across all pairs.
+        candidates = []
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            bg_val = bg(inp)
+            hist_in = color_histogram(inp)
+            hist_in.pop(bg_val, None)
+            if len(hist_in) < 2:
+                return
+            colors = list(hist_in.keys())
+            R, C = shape(inp)
+            found = None
+            for mc in colors:
+                in_cells  = set(self._cells_of_color(inp, mc))
+                out_cells = set(self._cells_of_color(out, mc))
+                if in_cells == out_cells or not in_cells or not out_cells:
+                    continue
+                for ac in colors:
+                    if ac == mc:
+                        continue
+                    ac_in  = set(self._cells_of_color(inp, ac))
+                    ac_out = set(self._cells_of_color(out, ac))
+                    if ac_in != ac_out or not ac_in:
+                        continue
+                    # Compute dynamic direction for THIS pair
+                    cr_i, cc_i = self._centroid(list(in_cells))
+                    cr_a, cc_a = self._centroid(list(ac_in))
+                    dr_s, dc_s = self._direction_from_delta(cr_a - cr_i, cc_a - cc_i)
+                    # Exact-reconstruction validation
+                    final_pos = self._slide_until_adjacent(
+                        list(in_cells), list(ac_in), dr_s, dc_s, R, C)
+                    pred = clone(inp)
+                    for r, c in in_cells:
+                        pred[r][c] = bg_val
+                    for r, c in final_pos:
+                        pred[r][c] = mc
+                    if equal(pred, out):
+                        found = (mc, ac)
+                        break
+                if found:
+                    break
+            if found:
+                candidates.append(found)
+
+        if not candidates:
+            return
+        unique = set(candidates)
+        if len(unique) == 1 and len(candidates) == len(train_pairs):
+            self._mover_color, self._attract_color = candidates[0]
+            self._conf = 0.85
+        elif len(unique) == 1 and len(candidates) >= len(train_pairs) - 1:
+            self._mover_color, self._attract_color = candidates[0]
+            self._conf = 0.70
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if self._mover_color is None:
+            return None
+        R, C = shape(test_input)
+        mover   = self._cells_of_color(test_input, self._mover_color)
+        attract = self._cells_of_color(test_input, self._attract_color)
+        if not mover or not attract:
+            return None
+        # Compute direction dynamically from mover→attractor centroid
+        cr_m, cc_m = self._centroid(mover)
+        cr_a, cc_a = self._centroid(attract)
+        dr, dc = self._direction_from_delta(cr_a - cr_m, cc_a - cc_m)
+        final_pos = self._slide_until_adjacent(mover, attract, dr, dc, R, C)
+        g = clone(test_input)
+        bg_val = bg(test_input)
+        for r, c in mover:
+            g[r][c] = bg_val
+        for r, c in final_pos:
+            g[r][c] = self._mover_color
+        return g
+
+# ──────────────────────────────────────────────────────────────────
+
+
+class FrameSymmetryExpandSolver(BaseSolver):
+    """
+    Detects a hollow rectangular frame (perimeter pixels of one color) and
+    an interior object (another color).  Completes the interior object to be
+    symmetric (horizontal, vertical, or both) within the bounding frame.
+    Accepts both solid frames and notched-corner frames where the four
+    corner cells may be absent.
+    """
+    name = "FrameSymmetryExpandSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._frame_color = None
+        self._inner_color = None
+        self._sym_h       = False
+        self._sym_v       = False
+
+    @staticmethod
+    def _detect_frame(grid):
+        """
+        Return (frame_color, r1, c1, r2, c2) for a rectangular frame, or None.
+        Handles solid, notched-corner, wing-extended, and notched-top/bottom frames.
+        Strategy: use (leftmost, rightmost) fc-cell per row to identify candidate
+        column spans; find topmost/bottommost rows sharing the same span; validate
+        interior vertical sides with ±1 tolerance for wing-extended rows.
+        """
+        from collections import defaultdict
+        R, C = shape(grid)
+        hist = color_histogram(grid)
+        hist.pop(bg(grid), None)
+        for fc, _ in sorted(hist.items(), key=lambda x: -x[1]):
+            # Per-row: (c_left, c_right) using leftmost/rightmost fc cell
+            row_span = {}
+            for r in range(R):
+                fc_cols_in_row = [c for c in range(C) if grid[r][c] == fc]
+                if len(fc_cols_in_row) >= 2:
+                    row_span[r] = (fc_cols_in_row[0], fc_cols_in_row[-1])
+
+            if not row_span:
+                continue
+
+            # Group rows by their (c_left, c_right) span
+            span_to_rows = defaultdict(list)
+            for r, span in row_span.items():
+                if span[1] - span[0] >= 2:
+                    span_to_rows[span].append(r)
+
+            best_result = None
+            best_score  = 0
+            for (c1, c2), rows in span_to_rows.items():
+                if len(rows) < 2:
+                    continue
+                r1, r2 = min(rows), max(rows)
+                if r2 - r1 < 2:
+                    continue
+                interior = list(range(r1 + 1, r2))
+                if interior:
+                    # Allow ±1 wing-replacement: side may be one column beyond c1/c2
+                    def has_left(r, c1=c1):
+                        return (grid[r][c1] == fc or
+                                (c1 > 0 and grid[r][c1-1] == fc))
+                    def has_right(r, c2=c2):
+                        return (grid[r][c2] == fc or
+                                (c2 < C-1 and grid[r][c2+1] == fc))
+                    if not all(has_left(r) and has_right(r) for r in interior):
+                        continue
+                score = (c2 - c1) * (r2 - r1)
+                if score > best_score:
+                    best_score = score
+                    best_result = (fc, r1, c1, r2, c2)
+
+            if best_result:
+                return best_result
+        return None
+    def learn(self, train_pairs):
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            res = self._detect_frame(inp)
+            if res is None:
+                return
+            fc, r1, c1, r2, c2 = res
+            # dominant inner color
+            inner_hist = {}
+            for r in range(r1 + 1, r2):
+                for c in range(c1 + 1, c2):
+                    v = inp[r][c]
+                    if v != 0 and v != fc:
+                        inner_hist[v] = inner_hist.get(v, 0) + 1
+            if not inner_hist:
+                return
+            ic = max(inner_hist, key=inner_hist.get)
+            H = r2 - r1 - 1;  W = c2 - c1 - 1
+            if H == 0 or W == 0:
+                return
+            inner_out = [[out[r][c] for c in range(c1 + 1, c2)]
+                         for r in range(r1 + 1, r2)]
+            h_sym = all(inner_out[i][j] == inner_out[i][W - 1 - j]
+                        for i in range(H) for j in range(W))
+            v_sym = all(inner_out[i][j] == inner_out[H - 1 - i][j]
+                        for i in range(H) for j in range(W))
+            if not h_sym and not v_sym:
+                return
+            if self._frame_color is None:
+                self._frame_color = fc
+                self._inner_color = ic
+                self._sym_h = h_sym
+                self._sym_v = v_sym
+                self._conf  = 0.78
+            elif self._frame_color != fc or self._inner_color != ic:
+                return
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if self._frame_color is None:
+            return None
+        fc = self._frame_color
+        ic = self._inner_color
+        R, C = shape(test_input)
+        g = clone(test_input)
+
+        # Find all connected components of frame-color cells
+        visited = [[False]*C for _ in range(R)]
+        def bfs(sr, sc):
+            comp = []
+            q = [(sr, sc)]
+            visited[sr][sc] = True
+            while q:
+                r, c = q.pop()
+                comp.append((r, c))
+                for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                    nr, nc = r+dr, c+dc
+                    if 0 <= nr < R and 0 <= nc < C and not visited[nr][nc] and test_input[nr][nc] == fc:
+                        visited[nr][nc] = True
+                        q.append((nr, nc))
+            return comp
+
+        ccs = []
+        for r in range(R):
+            for c in range(C):
+                if test_input[r][c] == fc and not visited[r][c]:
+                    ccs.append(bfs(r, c))
+
+        any_change = False
+        for cc in ccs:
+            cc_set = set(cc)
+            # Build masked grid: fc only for this CC, else 0
+            masked = [[0]*C for _ in range(R)]
+            for r2, c2 in cc:
+                masked[r2][c2] = fc
+            res = self._detect_frame(masked)
+            if res is None:
+                continue
+            _, r1, c1, r2c, c2c = res
+            H = r2c - r1 - 1;  W = c2c - c1 - 1
+            if H <= 0 or W <= 0:
+                continue
+            if self._sym_h:
+                for i in range(H):
+                    for j in range(W):
+                        r  = r1 + 1 + i;  c  = c1 + 1 + j
+                        rj = c1 + 1 + (W - 1 - j)
+                        if g[r][c] == ic:
+                            g[r][rj] = ic;  any_change = True
+                        elif g[r][rj] == ic:
+                            g[r][c] = ic;   any_change = True
+            if self._sym_v:
+                for i in range(H):
+                    for j in range(W):
+                        r  = r1 + 1 + i;  ri = r1 + 1 + (H - 1 - i)
+                        c  = c1 + 1 + j
+                        if g[r][c] == ic:
+                            g[ri][c] = ic;  any_change = True
+                        elif g[ri][c] == ic:
+                            g[r][c] = ic;   any_change = True
+        return g if any_change else None
+
+
+# ──────────────────────────────────────────────────────────────────
+
+
+class SeparatorZoneFillSolver(BaseSolver):
+    """
+    Detects solid-color separator lines (full rows or columns of one color)
+    that partition the grid into rectangular zones.  Learns a per-zone fill
+    color from training examples and replicates it in the test output.
+    """
+    name = "SeparatorZoneFillSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._sep_color  = None
+        self._axis       = None     # 'row' | 'col'
+        self._zone_fills = []       # list of fill colors per zone index
+
+    @staticmethod
+    def _find_sep_lines(grid, axis):
+        R, C = shape(grid)
+        lines = []
+        if axis == 'row':
+            for r in range(R):
+                vals = set(grid[r])
+                if len(vals) == 1:
+                    lines.append((r, vals.pop()))
+        else:
+            for c in range(C):
+                vals = set(grid[r][c] for r in range(R))
+                if len(vals) == 1:
+                    lines.append((c, vals.pop()))
+        return lines
+
+    @staticmethod
+    def _zone_ranges(sep_indices, total):
+        boundaries = [-1] + sep_indices + [total]
+        zones = []
+        for i in range(len(boundaries) - 1):
+            s = boundaries[i] + 1
+            e = boundaries[i + 1]
+            if s < e:
+                zones.append((s, e))
+        return zones
+
+    def _zone_dominant_color(self, grid, zone, axis, bg_val):
+        R, C = shape(grid)
+        cells = []
+        if axis == 'row':
+            s, e = zone
+            for r in range(s, e):
+                for c in range(C):
+                    if grid[r][c] != bg_val:
+                        cells.append(grid[r][c])
+        else:
+            s, e = zone
+            for r in range(R):
+                for c in range(s, e):
+                    if grid[r][c] != bg_val:
+                        cells.append(grid[r][c])
+        if not cells:
+            return None
+        from collections import Counter
+        return Counter(cells).most_common(1)[0][0]
+
+    def learn(self, train_pairs):
+        for axis in ('row', 'col'):
+            ok = True
+            sep_color_cand = None
+            zone_fills_cand = None
+            for p in train_pairs:
+                inp, out = p['input'], p['output']
+                bg_val = bg(inp)
+                lines = self._find_sep_lines(inp, axis)
+                if not lines:
+                    ok = False; break
+                sep_idx  = [idx for idx, _ in lines]
+                sep_cols = set(col for _, col in lines)
+                if len(sep_cols) != 1:
+                    ok = False; break
+                sc = sep_cols.pop()
+                total = shape(inp)[0] if axis == 'row' else shape(inp)[1]
+                zones = self._zone_ranges(sep_idx, total)
+                if not zones:
+                    ok = False; break
+                fills = [self._zone_dominant_color(out, z, axis, bg_val)
+                         for z in zones]
+                if sep_color_cand is None:
+                    sep_color_cand = sc
+                    zone_fills_cand = fills
+                else:
+                    if sep_color_cand != sc or zone_fills_cand != fills:
+                        ok = False; break
+            if ok and sep_color_cand is not None and zone_fills_cand:
+                self._sep_color  = sep_color_cand
+                self._axis       = axis
+                self._zone_fills = zone_fills_cand
+                self._conf       = 0.72
+                return
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if self._sep_color is None:
+            return None
+        bg_val = bg(test_input)
+        lines  = self._find_sep_lines(test_input, self._axis)
+        if not lines:
+            return None
+        sep_idx = [idx for idx, _ in lines]
+        total   = shape(test_input)[0] if self._axis == 'row' else shape(test_input)[1]
+        zones   = self._zone_ranges(sep_idx, total)
+        if len(zones) != len(self._zone_fills):
+            return None
+        R, C = shape(test_input)
+        g = clone(test_input)
+        for (s, e), fc in zip(zones, self._zone_fills):
+            if fc is None:
+                continue
+            if self._axis == 'row':
+                for r in range(s, e):
+                    for c in range(C):
+                        if g[r][c] == bg_val:
+                            g[r][c] = fc
+            else:
+                for r in range(R):
+                    for c in range(s, e):
+                        if g[r][c] == bg_val:
+                            g[r][c] = fc
+        return g
+
+
+# ──────────────────────────────────────────────────────────────────
+
+
+class EmbeddedPatternExtractSolver(BaseSolver):
+    """
+    Handles tasks where the output is a crop of a connected sub-object from
+    a larger padded input grid.  Learns whether to use a bounding-box crop or
+    to extract a specific connected component (by size rank, smallest first).
+    """
+    name = "EmbeddedPatternExtractSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._rule    = None   # 'bbox_crop' | 'inner_object'
+        self._cc_rank = None   # 0 = smallest matching CC
+
+    def _bbox_of_fg(self, grid):
+        bg_val = bg(grid)
+        R, C   = shape(grid)
+        rows = [r for r in range(R)
+                if any(grid[r][c] != bg_val for c in range(C))]
+        cols = [c for c in range(C)
+                if any(grid[r][c] != bg_val for r in range(R))]
+        if not rows or not cols:
+            return None
+        return rows[0], cols[0], rows[-1], cols[-1]
+
+    def learn(self, train_pairs):
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            iR, iC = shape(inp)
+            oR, oC = shape(out)
+            if oR >= iR and oC >= iC:
+                return
+            # 1. Simple bounding-box crop
+            bbox = self._bbox_of_fg(inp)
+            if bbox is not None:
+                r1, c1, r2, c2 = bbox
+                extracted = extract_subgrid(inp, r1, c1, r2, c2)
+                if equal(extracted, out):
+                    self._rule = 'bbox_crop'
+                    self._conf = 0.82
+                    return
+            # 2. Try every CC by size rank (smallest first)
+            comps = connected_components(inp, color=None, include_bg=False)
+            if comps:
+                for rank, comp in enumerate(sorted(comps, key=len)):
+                    r1b, c1b, r2b, c2b = bounding_box(comp)
+                    sub = extract_subgrid(inp, r1b, c1b, r2b, c2b)
+                    if shape(sub) == (oR, oC) and equal(sub, out):
+                        self._rule    = 'inner_object'
+                        self._cc_rank = rank
+                        self._conf    = 0.80
+                        return
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if self._rule is None:
+            return None
+        if self._rule == 'bbox_crop':
+            bbox = self._bbox_of_fg(test_input)
+            if bbox is None:
+                return None
+            r1, c1, r2, c2 = bbox
+            return extract_subgrid(test_input, r1, c1, r2, c2)
+        if self._rule == 'inner_object':
+            comps = connected_components(test_input, color=None, include_bg=False)
+            if not comps:
+                return None
+            sorted_comps = sorted(comps, key=len)
+            rank = min(self._cc_rank, len(sorted_comps) - 1)
+            r1, c1, r2, c2 = bounding_box(sorted_comps[rank])
+            return extract_subgrid(test_input, r1, c1, r2, c2)
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────
+
+
+class AngularConcaveFillSolver(BaseSolver):
+    """
+    Identifies an L-shaped or angular wall structure (a foreground color
+    forming axis-aligned corner shapes).  Background cells at the inner
+    concave corner — i.e., cells adjacent to wall pixels on both a horizontal
+    and a vertical neighbour simultaneously — are filled with a learned color.
+    """
+    name = "AngularConcaveFillSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._wall_color = None
+        self._fill_color = None
+
+    @staticmethod
+    def _concave_cells(grid, wall_c, bg_val):
+        """
+        Return the set of background cells that have at least one wall neighbour
+        in the horizontal direction AND at least one in the vertical direction.
+        """
+        R, C = shape(grid)
+        cells = set()
+        for r in range(R):
+            for c in range(C):
+                if grid[r][c] != bg_val:
+                    continue
+                has_h = ((c > 0     and grid[r][c - 1] == wall_c) or
+                         (c < C - 1 and grid[r][c + 1] == wall_c))
+                has_v = ((r > 0     and grid[r - 1][c] == wall_c) or
+                         (r < R - 1 and grid[r + 1][c] == wall_c))
+                if has_h and has_v:
+                    cells.add((r, c))
+        return cells
+
+    def learn(self, train_pairs):
+        candidate = None
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            bg_val = bg(inp)
+            # cells that were background and changed in the output
+            changed = [(r, c) for r, c, _ in changed_cells(inp, out)
+                       if inp[r][c] == bg_val and out[r][c] != bg_val]
+            if not changed:
+                return
+            # fill color = most common new value at changed cells
+            fill_ctr = {}
+            for r, c in changed:
+                fill_ctr[out[r][c]] = fill_ctr.get(out[r][c], 0) + 1
+            fc = max(fill_ctr, key=fill_ctr.get)
+            # wall color = most common foreground color other than fill color
+            hist = color_histogram(inp)
+            hist.pop(bg_val, None)
+            hist.pop(fc, None)
+            if not hist:
+                return
+            wc = max(hist, key=hist.get)
+            # validate: concave corner cells ≈ changed cells
+            corners   = self._concave_cells(inp, wc, bg_val)
+            chg_set   = set(changed)
+            if not corners:
+                return
+            overlap = len(corners & chg_set)
+            if overlap < 0.7 * max(len(corners), len(chg_set)):
+                return
+            if candidate is None:
+                candidate = (wc, fc)
+            elif candidate != (wc, fc):
+                return
+        if candidate:
+            self._wall_color = candidate[0]
+            self._fill_color = candidate[1]
+            self._conf = 0.80
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if self._wall_color is None:
+            return None
+        bg_val = bg(test_input)
+        g      = clone(test_input)
+        cells  = self._concave_cells(test_input, self._wall_color, bg_val)
+        for r, c in cells:
+            g[r][c] = self._fill_color
+        return g
+
+
 # ══════════════════════════════════════════════════════════════════
 # ENSEMBLE  –  run all solvers, self-validate, pick best
 # ══════════════════════════════════════════════════════════════════
@@ -1190,6 +1817,11 @@ ALL_SOLVER_CLASSES = [
     PerimeterOutlineSolver,
     RecursiveStructureSolver,
     SpatialRelationSolver,
+    RigidBodyAttractionSolver,
+    FrameSymmetryExpandSolver,
+    SeparatorZoneFillSolver,
+    EmbeddedPatternExtractSolver,
+    AngularConcaveFillSolver,
 ]
 
 # Composite combinations
@@ -1214,6 +1846,24 @@ def solve_task(train_pairs, test_input, hint_category=None):
     best_name   = None
     best_conf   = -1.0
 
+    # Pre-compute average training change count for sanity gating
+    def _avg_train_changes(pairs):
+        total = 0; n = 0
+        for p in pairs:
+            inp, out = p['input'], p['output']
+            R, C = len(inp), len(inp[0]) if inp else 0
+            if len(out) != R or (R and len(out[0]) != C): continue
+            total += sum(inp[i][j] != out[i][j] for i in range(R) for j in range(C))
+            n += 1
+        return total / n if n else 0.0
+
+    def _pred_changes(test_inp, pred):
+        R, C = len(test_inp), len(test_inp[0]) if test_inp else 0
+        if len(pred) != R or (R and len(pred[0]) != C): return -1
+        return sum(test_inp[i][j] != pred[i][j] for i in range(R) for j in range(C))
+
+    avg_ch = _avg_train_changes(train_pairs)
+
     # Single solvers
     for cls in ALL_SOLVER_CLASSES:
         try:
@@ -1228,6 +1878,11 @@ def solve_task(train_pairs, test_input, hint_category=None):
             # Self-validate: exact match on ALL training pairs ≥ 1 required
             train_ok = s._validate(train_pairs)
             final_conf = c * train_ok
+            # Sanity: penalize predictions that change far fewer cells than training
+            if avg_ch > 3:
+                pch = _pred_changes(test_input, pred)
+                if pch >= 0 and pch < avg_ch * 0.25:
+                    final_conf *= 0.5
             if final_conf > best_conf:
                 best_conf = final_conf
                 best_pred = pred
