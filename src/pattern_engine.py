@@ -1204,6 +1204,12 @@ def solve_task(train_pairs, test_input, hint_category=None):
     Run full solver ensemble on a single task.
     Returns (prediction, solver_name, confidence).
     """
+    # Normalise: accept both (input, output) tuples and {'input':…,'output':…} dicts
+    train_pairs = [
+        p if isinstance(p, dict) else {'input': p[0], 'output': p[1]}
+        for p in train_pairs
+    ]
+
     best_pred   = None
     best_name   = None
     best_conf   = -1.0
