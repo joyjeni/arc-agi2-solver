@@ -2461,6 +2461,259 @@ class MeetInMiddleSolver(BaseSolver):
             return None
         return self._build(test_input)
 
+# ── NEW SOLVERS v4 ──────────────────────────────────────────────────────────
+# ── PixelRowColFillSolver ─────────────────────────────────────────────────
+class PixelRowColFillSolver(BaseSolver):
+    """
+    Each non-bg pixel marks its row or column for fill (axis learned from training).
+    Multiple pixels of the same color each apply to their own row/column.
+    Row fills take priority over column fills at intersections.
+    """
+    name = "PixelRowColFillSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._color_axis = {}
+
+    def _infer_axis(self, inp, out):
+        R, C = len(inp), len(inp[0])
+        bg_col = bg(inp)
+        pixels = {}
+        for r in range(R):
+            for c in range(C):
+                v = inp[r][c]
+                if v != bg_col:
+                    pixels.setdefault(v, []).append((r, c))
+        if not pixels:
+            return None
+        color_axis = {}
+        for color, pts in pixels.items():
+            best_axis = None
+            for axis in ('row', 'col'):
+                ok = True
+                for (r, c) in pts:
+                    if axis == 'row':
+                        seq = out[r][:]
+                    else:
+                        seq = [out[rr][c] for rr in range(R)]
+                    match = sum(1 for v in seq if v == color)
+                    if match / len(seq) < 0.5:
+                        ok = False
+                        break
+                if ok:
+                    best_axis = axis
+                    break
+            if best_axis is None:
+                return None
+            if color in color_axis and color_axis[color] != best_axis:
+                return None
+            color_axis[color] = best_axis
+        if len(color_axis) != len(pixels):
+            return None
+        return color_axis
+
+    def learn(self, train_pairs):
+        combined = {}
+        for p in train_pairs:
+            ca = self._infer_axis(p['input'], p['output'])
+            if ca is None:
+                self._conf = 0.0
+                return
+            for color, axis in ca.items():
+                if color in combined and combined[color] != axis:
+                    self._conf = 0.0
+                    return
+                combined[color] = axis
+        if not combined:
+            self._conf = 0.0
+            return
+        self._color_axis = combined
+        self._conf = self._validate(train_pairs)
+
+    def apply(self, input_grid):
+        if not self._color_axis:
+            return None
+        R, C = len(input_grid), len(input_grid[0])
+        bg_col = bg(input_grid)
+        pixels = {}
+        for r in range(R):
+            for c in range(C):
+                v = input_grid[r][c]
+                if v != bg_col and v in self._color_axis:
+                    pixels.setdefault(v, []).append((r, c))
+        result = [row[:] for row in input_grid]
+        for color, pts in pixels.items():
+            if self._color_axis[color] == 'col':
+                for (r, c) in pts:
+                    for rr in range(R):
+                        result[rr][c] = color
+        for color, pts in pixels.items():
+            if self._color_axis[color] == 'row':
+                for (r, c) in pts:
+                    for cc in range(C):
+                        result[r][cc] = color
+        return result
+
+
+# ── CrossFillIntersectSolver ───────────────────────────────────────────────
+class CrossFillIntersectSolver(BaseSolver):
+    """
+    Each non-bg pixel paints its entire row and column.
+    Intersections of two different colors receive an intersection marker color
+    learned from training.
+    """
+    name = "CrossFillIntersectSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._inter_color = None
+
+    def learn(self, train_pairs):
+        inter_color = None
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            R, C = len(inp), len(inp[0])
+            bg_col = bg(inp)
+            pixels = [(r, c, inp[r][c]) for r in range(R) for c in range(C) if inp[r][c] != bg_col]
+            if len(pixels) < 2:
+                self._conf = 0.0
+                return
+            found = set()
+            for i, (ri, ci, vi) in enumerate(pixels):
+                for j, (rj, cj, vj) in enumerate(pixels):
+                    if i == j or vi == vj:
+                        continue
+                    found.add(out[ri][cj])
+            if len(found) != 1:
+                self._conf = 0.0
+                return
+            ic = found.pop()
+            if inter_color is None:
+                inter_color = ic
+            elif inter_color != ic:
+                self._conf = 0.0
+                return
+        if inter_color is None:
+            self._conf = 0.0
+            return
+        self._inter_color = inter_color
+        self._conf = self._validate(train_pairs)
+
+    def apply(self, input_grid):
+        if self._inter_color is None:
+            return None
+        R, C = len(input_grid), len(input_grid[0])
+        bg_col = bg(input_grid)
+        pixels = [(r, c, input_grid[r][c]) for r in range(R) for c in range(C) if input_grid[r][c] != bg_col]
+        result = [row[:] for row in input_grid]
+        for (ri, ci, vi) in pixels:
+            for cc in range(C):
+                if result[ri][cc] == bg_col or result[ri][cc] == vi:
+                    result[ri][cc] = vi
+            for rr in range(R):
+                if result[rr][ci] == bg_col or result[rr][ci] == vi:
+                    result[rr][ci] = vi
+        for i, (ri, ci, vi) in enumerate(pixels):
+            for j, (rj, cj, vj) in enumerate(pixels):
+                if i == j or vi == vj:
+                    continue
+                result[ri][cj] = self._inter_color
+                result[rj][ci] = self._inter_color
+        return result
+
+
+# ── GridSectionColorFillSolver ─────────────────────────────────────────────
+class GridSectionColorFillSolver(BaseSolver):
+    """
+    Divider color forms complete rows/columns splitting the grid into rectangular
+    sections.  Each section is assigned a fill color learned from training.
+    """
+    name = "GridSectionColorFillSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._divider_color = None
+        self._section_fills = []
+        self._n_sections = 0
+
+    def _get_divider(self, grid):
+        R, C = len(grid), len(grid[0])
+        for color in range(1, 10):
+            rows = [r for r in range(R) if all(grid[r][c] == color for c in range(C))]
+            cols = [c for c in range(C) if all(grid[r][c] == color for r in range(R))]
+            if rows or cols:
+                return color, rows, cols
+        return None, [], []
+
+    def _sections(self, R, C, div_rows, div_cols):
+        rb = sorted(set([-1] + div_rows + [R]))
+        cb = sorted(set([-1] + div_cols + [C]))
+        secs = []
+        for i in range(len(rb) - 1):
+            r0, r1 = rb[i] + 1, rb[i + 1]
+            if r0 >= r1: continue
+            for j in range(len(cb) - 1):
+                c0, c1 = cb[j] + 1, cb[j + 1]
+                if c0 >= c1: continue
+                secs.append((r0, r1, c0, c1))
+        return secs
+
+    def learn(self, train_pairs):
+        self._divider_color = None
+        all_fills = []
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            R, C = len(inp), len(inp[0])
+            dc, div_rows, div_cols = self._get_divider(inp)
+            if dc is None:
+                self._conf = 0.0
+                return
+            if self._divider_color is None:
+                self._divider_color = dc
+            elif self._divider_color != dc:
+                self._conf = 0.0
+                return
+            bg_col = bg(inp)
+            secs = self._sections(R, C, div_rows, div_cols)
+            if len(secs) < 2:
+                self._conf = 0.0
+                return
+            fills = []
+            for (r0, r1, c0, c1) in secs:
+                cells = [out[r][c] for r in range(r0, r1) for c in range(c0, c1)]
+                if len(set(cells)) > 1:
+                    self._conf = 0.0
+                    return
+                fills.append(cells[0])
+            all_fills.append(fills)
+        if not all_fills:
+            self._conf = 0.0
+            return
+        self._section_fills = all_fills[-1]
+        self._n_sections = len(self._section_fills)
+        self._conf = self._validate(train_pairs)
+
+    def apply(self, input_grid):
+        if self._divider_color is None:
+            return None
+        R, C = len(input_grid), len(input_grid[0])
+        dc, div_rows, div_cols = self._get_divider(input_grid)
+        if dc is None or dc != self._divider_color:
+            return None
+        bg_col = bg(input_grid)
+        secs = self._sections(R, C, div_rows, div_cols)
+        if len(secs) != self._n_sections:
+            return None
+        result = [row[:] for row in input_grid]
+        for idx, (r0, r1, c0, c1) in enumerate(secs):
+            fill = self._section_fills[idx] if idx < len(self._section_fills) else bg_col
+            if fill != bg_col:
+                for r in range(r0, r1):
+                    for c in range(c0, c1):
+                        result[r][c] = fill
+        return result
+
+
 
 ALL_SOLVER_CLASSES = [
     NeighborhoodRuleLearner,
@@ -2494,6 +2747,9 @@ ALL_SOLVER_CLASSES = [
     PeriodicStripeRepeatSolver,
     CrossIntersectionFillSolver,
     MeetInMiddleSolver,
+    PixelRowColFillSolver,
+    CrossFillIntersectSolver,
+    GridSectionColorFillSolver,
 ]
 
 # Composite combinations
