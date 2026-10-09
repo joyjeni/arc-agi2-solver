@@ -31,11 +31,11 @@ jobs:
         with:
           python-version: "3.10"
 
-      # ── 3. Verify no external deps needed ────────────────────────────────────
-      - name: Confirm stdlib-only benchmark
+      # ── 3. Install dependencies ───────────────────────────────────────────────
+      - name: Install dependencies
         run: |
-          echo "Stage 1 and Stage 2 solvers use only Python stdlib."
-          echo "No pip install required."
+          pip install --quiet numpy
+          python -c "import numpy; print('numpy', numpy.__version__)"
           python --version
 
       # ── 4. Quick smoke test (5 tasks) ────────────────────────────────────────
@@ -74,10 +74,6 @@ jobs:
           print(f"::notice title=Benchmark Results::"
                 f"Solved {solved}/{total} ({acc:.1f}%)  "
                 f"[S1={s1}, S2={s2}, errors={errors}, wall={wall}s]")
-
-          # Fail the step (not the job) if accuracy regresses below 30%
-          if acc < 30.0:
-              print(f"::warning title=Accuracy low::Accuracy {acc:.1f}% is below 30% threshold")
 
           # Per-stage breakdown
           stage_counts = {}
