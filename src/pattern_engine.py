@@ -1792,9 +1792,675 @@ class AngularConcaveFillSolver(BaseSolver):
         return g
 
 
+
+
+# ──────────────────────────────────────────────────────────────────
+# BoundingBoxEnclosureReplaceSolver
+# Finds the bounding box of all cells with a learned "marker" color,
+# then replaces all cells of a learned "target" color that fall inside
+# that bounding box with a learned "replacement" color.
+# ──────────────────────────────────────────────────────────────────
+class BoundingBoxEnclosureReplaceSolver(BaseSolver):
+    """
+    Learns three colors from training pairs:
+      marker_color  — acts as a boundary / frame
+      target_color  — cells to be relabelled
+      replace_color — the new label for target cells inside the bbox
+    At inference: compute axis-aligned bounding box of all marker_color
+    cells, then remap every target_color cell inside that bbox to
+    replace_color.
+    """
+    name = "BoundingBoxEnclosureReplaceSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._marker  = None
+        self._target  = None
+        self._replace = None
+
+    @staticmethod
+    def _bbox(grid, color):
+        rows = [r for r, row in enumerate(grid) for v in row if v == color]
+        cols = [c for row in grid for c, v in enumerate(row) if v == color]
+        if not rows:
+            return None
+        return min(rows), max(rows), min(cols), max(cols)
+
+    def learn(self, train_pairs):
+        candidate = None
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            # Find cells that changed value
+            changes = [(r, c, inp[r][c], out[r][c])
+                       for r, c, nv in changed_cells(inp, out)
+                       for _ in [None]
+                       if True]
+            # rebuild with proper format
+            changes = []
+            for r, c, nv in changed_cells(inp, out):
+                changes.append((r, c, inp[r][c], nv))
+            if not changes:
+                return
+
+            # target_color  = old value at changed cells (should be unique)
+            old_vals = {ov for _, _, ov, _ in changes}
+            new_vals = {nv for _, _, _, nv in changes}
+            if len(old_vals) != 1 or len(new_vals) != 1:
+                return
+            tgt = old_vals.pop()
+            rep = new_vals.pop()
+            if tgt == rep:
+                return
+
+            # marker_color: a color present in inp that is NOT tgt, NOT rep,
+            # whose bbox contains ALL changed cells AND whose interior
+            # target-color cells exactly match the changed cells.
+            bg_v = bg(inp)
+            inp_colors = sorted(set(
+                v for row in inp for v in row
+                if v != tgt and v != rep and v != bg_v
+            ))
+            found_marker = None
+            actual = sorted([(r, c) for r, c, _, _ in changes])
+            for mc in inp_colors:
+                bb = self._bbox(inp, mc)
+                if bb is None:
+                    continue
+                r0, r1, c0, c1 = bb
+                # All changed cells must lie inside bbox
+                if not all(r0 <= r <= r1 and c0 <= c <= c1
+                           for r, c, _, _ in changes):
+                    continue
+                # The target-color cells inside bbox must equal changed cells
+                expected = sorted([(r, c) for r in range(r0, r1+1)
+                                   for c in range(c0, c1+1)
+                                   if inp[r][c] == tgt])
+                if expected == actual:
+                    found_marker = mc
+                    break
+            if found_marker is None:
+                return
+
+            this = (found_marker, tgt, rep)
+            if candidate is None:
+                candidate = this
+            elif candidate != this:
+                return
+
+        if candidate:
+            self._marker, self._target, self._replace = candidate
+            self._conf = 0.88
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if self._marker is None:
+            return None
+        bb = self._bbox(test_input, self._marker)
+        if bb is None:
+            return None
+        r0, r1, c0, c1 = bb
+        g = clone(test_input)
+        for r in range(r0, r1+1):
+            for c in range(c0, c1+1):
+                if g[r][c] == self._target:
+                    g[r][c] = self._replace
+        return g
+
+
+# ──────────────────────────────────────────────────────────────────
+# GridSectionThresholdFillSolver
+# For grids separated by a single "separator" color forming a full
+# row+column cross-hatch, divides the grid into rectangular sections.
+# Sections where a single non-bg, non-sep color appears ≥ threshold
+# times get filled solid with that color; other sections are cleared
+# to background.
+# ──────────────────────────────────────────────────────────────────
+class GridSectionThresholdFillSolver(BaseSolver):
+    """
+    Detects axis-aligned grid separators (rows and columns entirely of
+    one color) that divide the input into rectangular sub-sections.
+    Learns a threshold (default 2): sections with ≥ threshold cells of
+    the same foreground color are filled solid with that color; sections
+    below the threshold are cleared to background.
+    """
+    name = "GridSectionThresholdFillSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._sep_color = None
+        self._threshold = 2
+        self._fill_rule = "dominant"   # "dominant" = fill solid with dominant color
+
+    @staticmethod
+    def _find_separators(grid, sep_color):
+        R, C = shape(grid)
+        sep_rows = [r for r in range(R) if all(grid[r][c] == sep_color for c in range(C))]
+        sep_cols = [c for c in range(C) if all(grid[r][c] == sep_color for r in range(R))]
+        return sep_rows, sep_cols
+
+    @staticmethod
+    def _get_sections(grid, sep_rows, sep_cols):
+        R, C = shape(grid)
+        row_bounds = []
+        prev = 0
+        for sr in sorted(sep_rows):
+            if sr > prev:
+                row_bounds.append((prev, sr))
+            prev = sr + 1
+        if prev < R:
+            row_bounds.append((prev, R))
+        col_bounds = []
+        prev = 0
+        for sc in sorted(sep_cols):
+            if sc > prev:
+                col_bounds.append((prev, sc))
+            prev = sc + 1
+        if prev < C:
+            col_bounds.append((prev, C))
+        sections = []
+        for (r0, r1) in row_bounds:
+            for (c0, c1) in col_bounds:
+                cells = [(r, c) for r in range(r0, r1) for c in range(c0, c1)]
+                sections.append(cells)
+        return sections
+
+    def learn(self, train_pairs):
+        # Step 1: detect separator color from first pair
+        first_inp = train_pairs[0]['input']
+        bg_val = bg(first_inp)
+
+        # Find which color forms complete rows AND complete columns
+        hist = color_histogram(first_inp)
+        hist.pop(bg_val, None)
+        sep_cand = None
+        for col, cnt in hist.items():
+            sr, sc = self._find_separators(first_inp, col)
+            if sr and sc:
+                sep_cand = col
+                break
+        if sep_cand is None:
+            return
+
+        # Step 2: validate rule — fill section(s) with MAX fg-cell count,
+        # clear all other sections.  Rule must hold on every training pair.
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            bg_v = bg(inp)
+            sr, sc = self._find_separators(inp, sep_cand)
+            if not sr or not sc:
+                return
+            sections = self._get_sections(inp, sr, sc)
+
+            # Count fg cells per section
+            section_counts = []
+            section_dominant = []
+            for cells in sections:
+                color_cnt = {}
+                for r, c in cells:
+                    v = inp[r][c]
+                    if v != bg_v and v != sep_cand:
+                        color_cnt[v] = color_cnt.get(v, 0) + 1
+                dominant  = max(color_cnt, key=color_cnt.get) if color_cnt else None
+                dom_count = color_cnt.get(dominant, 0) if dominant else 0
+                section_counts.append(dom_count)
+                section_dominant.append(dominant)
+
+            max_count = max(section_counts)
+            if max_count == 0:
+                return  # no foreground cells
+
+            # Validate output against max-count rule
+            for idx, (cells, cnt, dom) in enumerate(
+                    zip(sections, section_counts, section_dominant)):
+                out_vals = {out[r][c] for r, c in cells}
+                if cnt == max_count and dom is not None:
+                    if out_vals != {dom}:
+                        return
+                else:
+                    if out_vals != {bg_v}:
+                        return
+
+        self._sep_color = sep_cand
+        self._conf = 0.85
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if self._sep_color is None:
+            return None
+        bg_v = bg(test_input)
+        sr, sc = self._find_separators(test_input, self._sep_color)
+        if not sr or not sc:
+            return None
+        sections = self._get_sections(test_input, sr, sc)
+        # Count fg cells per section
+        section_counts = []
+        section_dominant = []
+        for cells in sections:
+            color_cnt = {}
+            for r, c in cells:
+                v = test_input[r][c]
+                if v != bg_v and v != self._sep_color:
+                    color_cnt[v] = color_cnt.get(v, 0) + 1
+            dominant  = max(color_cnt, key=color_cnt.get) if color_cnt else None
+            dom_count = color_cnt.get(dominant, 0) if dominant else 0
+            section_counts.append(dom_count)
+            section_dominant.append(dominant)
+        max_count = max(section_counts) if section_counts else 0
+        g = clone(test_input)
+        for cells, cnt, dom in zip(sections, section_counts, section_dominant):
+            fill = dom if (cnt == max_count and max_count > 0 and dom is not None) else bg_v
+            for r, c in cells:
+                g[r][c] = fill
+        return g
+
+
+
 # ══════════════════════════════════════════════════════════════════
 # ENSEMBLE  –  run all solvers, self-validate, pick best
 # ══════════════════════════════════════════════════════════════════
+
+
+# ── New edge-marker solvers (injected) ────────────────────
+# ══════════════════════════════════════════════════════════════════
+# LPathConnectorSolver
+#   Each foreground color has: one top-edge marker (defines its column)
+#   and optionally one side-edge marker (defines its row).
+#   Output draws a vertical segment from row 0 down to the side-marker row
+#   (or fills the entire column if no side marker), then a horizontal
+#   segment from the corner toward the nearest edge.
+# ══════════════════════════════════════════════════════════════════
+
+class LPathConnectorSolver(BaseSolver):
+    name = "LPathConnectorSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._ok = False
+
+    def _parse(self, inp):
+        """Return (top_markers, side_markers) or None if the input doesn't fit."""
+        R, C = len(inp), len(inp[0]) if inp else 0
+        bg_c = bg(inp)
+        top_markers  = {}   # color -> col  (row-0 non-corner cells)
+        side_markers = {}   # color -> (row, 'left'|'right')
+        for r in range(R):
+            for c in range(C):
+                v = inp[r][c]
+                if v == bg_c:
+                    continue
+                on_top   = (r == 0)
+                on_bot   = (r == R - 1)
+                on_left  = (c == 0)
+                on_right = (c == C - 1)
+                on_edge  = on_top or on_bot or on_left or on_right
+                if not on_edge:
+                    return None                       # interior cell ⇒ reject
+                if on_top and not on_left and not on_right:
+                    if v in top_markers:
+                        return None                   # duplicate top marker
+                    top_markers[v] = c
+                elif on_left and not on_top and not on_bot:
+                    if v in side_markers:
+                        return None
+                    side_markers[v] = (r, 'left')
+                elif on_right and not on_top and not on_bot:
+                    if v in side_markers:
+                        return None
+                    side_markers[v] = (r, 'right')
+                # corners and bottom-edge cells: ignore silently
+        return top_markers, side_markers
+
+    def _build(self, inp):
+        parsed = self._parse(inp)
+        if parsed is None:
+            return None
+        top_markers, side_markers = parsed
+        R, C = len(inp), len(inp[0]) if inp else 0
+        all_colors = set(top_markers) | set(side_markers)
+        if not all_colors:
+            return None
+        # Every color must have a top-row marker
+        if not all(col in top_markers for col in all_colors):
+            return None
+        out = [row[:] for row in inp]
+        for color in all_colors:
+            col_pos = top_markers[color]
+            if color in side_markers:
+                row_pos, side = side_markers[color]
+                # Vertical segment: rows 0 .. row_pos at col_pos
+                for r in range(row_pos + 1):
+                    out[r][col_pos] = color
+                # Horizontal segment toward the side edge
+                if side == 'left':
+                    for c in range(col_pos + 1):
+                        out[row_pos][c] = color
+                else:  # 'right'
+                    for c in range(col_pos, C):
+                        out[row_pos][c] = color
+            else:
+                # No side marker → fill entire column
+                for r in range(R):
+                    out[r][col_pos] = color
+        return out
+
+    def learn(self, pairs):
+        self._ok = False
+        if not pairs:
+            return
+        ok = sum(1 for p in pairs
+                 if self._build(p['input']) is not None
+                 and self._build(p['input']) == p['output'])
+        if ok == len(pairs):
+            self._ok = True
+            self._conf = 0.92
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if not self._ok:
+            return None
+        return self._build(test_input)
+
+
+# ══════════════════════════════════════════════════════════════════
+# PeriodicStripeRepeatSolver
+#   Exactly two foreground pixel-markers on the grid's border define
+#   positions for alternating "stripes" (whole rows or whole columns).
+#   The gap between the two markers determines the period; the pattern
+#   is extended to the far end of the grid.
+# ══════════════════════════════════════════════════════════════════
+
+class PeriodicStripeRepeatSolver(BaseSolver):
+    name = "PeriodicStripeRepeatSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._ok = False
+
+    def _build(self, inp):
+        R, C = len(inp), len(inp[0]) if inp else 0
+        bg_c = bg(inp)
+
+        # Collect all non-bg cells
+        cells = [(r, c, inp[r][c]) for r in range(R) for c in range(C)
+                 if inp[r][c] != bg_c]
+        if len(cells) != 2:
+            return None
+
+        (r1, c1, v1), (r2, c2, v2) = cells
+
+        def is_edge(r, c):
+            return r == 0 or r == R - 1 or c == 0 or c == C - 1
+
+        if not is_edge(r1, c1) or not is_edge(r2, c2):
+            return None
+
+        # Classify each cell: "row marker" (on left/right, not top/bottom),
+        # "col marker" (on top/bottom, not left/right).
+        def row_marker(r, c):
+            return (c == 0 or c == C - 1) and r not in (0, R - 1)
+
+        def col_marker(r, c):
+            return (r == 0 or r == R - 1) and c not in (0, C - 1)
+
+        out = [row[:] for row in inp]
+
+        if row_marker(r1, c1) and row_marker(r2, c2):
+            # Sort by row
+            if r1 > r2:
+                r1, c1, v1, r2, c2, v2 = r2, c2, v2, r1, c1, v1
+            step = r2 - r1
+            if step == 0:
+                return None
+            pos, ci = r1, 0
+            colors = [v1, v2]
+            while pos < R:
+                col = colors[ci % 2]
+                for c in range(C):
+                    out[pos][c] = col
+                pos += step
+                ci += 1
+
+        elif col_marker(r1, c1) and col_marker(r2, c2):
+            # Sort by col
+            if c1 > c2:
+                r1, c1, v1, r2, c2, v2 = r2, c2, v2, r1, c1, v1
+            step = c2 - c1
+            if step == 0:
+                return None
+            pos, ci = c1, 0
+            colors = [v1, v2]
+            while pos < C:
+                col = colors[ci % 2]
+                for r in range(R):
+                    out[r][pos] = col
+                pos += step
+                ci += 1
+
+        else:
+            return None
+
+        return out
+
+    def learn(self, pairs):
+        self._ok = False
+        if not pairs:
+            return
+        ok = sum(1 for p in pairs
+                 if self._build(p['input']) is not None
+                 and self._build(p['input']) == p['output'])
+        if ok == len(pairs):
+            self._ok = True
+            self._conf = 0.91
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if not self._ok:
+            return None
+        return self._build(test_input)
+
+
+# ══════════════════════════════════════════════════════════════════
+# CrossIntersectionFillSolver
+#   A single foreground color appears on the top row (defining active
+#   columns) and on the right edge (defining active rows).  The output
+#   places a learned fill color at every (active_row, active_col) cell.
+# ══════════════════════════════════════════════════════════════════
+
+class CrossIntersectionFillSolver(BaseSolver):
+    name = "CrossIntersectionFillSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._ok = False
+        self._fill_color = None
+
+    def _parse(self, inp):
+        """Return (marker_color, top_cols, right_rows) or None."""
+        R, C = len(inp), len(inp[0]) if inp else 0
+        bg_c = bg(inp)
+        top_cols   = []
+        right_rows = []
+        marker_colors = set()
+
+        for r in range(R):
+            for c in range(C):
+                v = inp[r][c]
+                if v == bg_c:
+                    continue
+                on_top   = (r == 0)
+                on_right = (c == C - 1)
+                on_left  = (c == 0)
+                on_bot   = (r == R - 1)
+                # Must be on top row or right column only (no corners shared between both)
+                if on_top and not on_right:
+                    marker_colors.add(v)
+                    top_cols.append(c)
+                elif on_right and not on_top:
+                    marker_colors.add(v)
+                    right_rows.append(r)
+                else:
+                    return None   # unexpected position
+
+        if len(marker_colors) != 1:
+            return None
+        if not top_cols or not right_rows:
+            return None
+        return marker_colors.pop(), top_cols, right_rows
+
+    def learn(self, pairs):
+        self._ok = False
+        self._fill_color = None
+        if not pairs:
+            return
+
+        ok_count = 0
+        fill_colors_seen = set()
+
+        for p in pairs:
+            inp, out = p['input'], p['output']
+            R, C = len(inp), len(inp[0]) if inp else 0
+            if len(out) != R or (R and len(out[0]) != C):
+                continue
+            bg_c = bg(inp)
+
+            parsed = self._parse(inp)
+            if parsed is None:
+                continue
+            marker_c, top_cols, right_rows = parsed
+
+            # Identify the fill color: present in output but absent in input
+            inp_colors = {inp[r][c] for r in range(R) for c in range(C)}
+            out_colors = {out[r][c] for r in range(R) for c in range(C)}
+            new_colors = out_colors - inp_colors - {bg_c}
+            if len(new_colors) != 1:
+                continue
+            fill_color = next(iter(new_colors))
+            fill_colors_seen.add(fill_color)
+
+            # Build expected
+            expected = [row[:] for row in inp]
+            for rr in right_rows:
+                for cc in top_cols:
+                    expected[rr][cc] = fill_color
+
+            if expected == out:
+                ok_count += 1
+
+        if ok_count == len(pairs) and len(fill_colors_seen) == 1:
+            self._ok = True
+            self._fill_color = fill_colors_seen.pop()
+            self._conf = 0.91
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if not self._ok:
+            return None
+        inp = test_input
+        R, C = len(inp), len(inp[0]) if inp else 0
+        bg_c = bg(inp)
+
+        parsed = self._parse(inp)
+        if parsed is None:
+            return None
+        _, top_cols, right_rows = parsed
+
+        out = [row[:] for row in inp]
+        for rr in right_rows:
+            for cc in top_cols:
+                out[rr][cc] = self._fill_color
+        return out
+
+
+# ══════════════════════════════════════════════════════════════════
+# MeetInMiddleSolver
+#   Two distinct colors appear on opposite (left/right) edges of the
+#   same interior row.  The output fills the row: left color fills from
+#   col 0 to mid-1, right color fills from mid+1 to C-1, and color 5
+#   is placed at the exact midpoint (requires odd width).
+# ══════════════════════════════════════════════════════════════════
+
+class MeetInMiddleSolver(BaseSolver):
+    name = "MeetInMiddleSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._ok = False
+
+    def _build(self, inp):
+        R, C = len(inp), len(inp[0]) if inp else 0
+        if C % 2 == 0:
+            return None   # need odd width for a single midpoint
+        bg_c = bg(inp)
+        mid_col = C // 2
+
+        left_cells  = {}   # row -> color
+        right_cells = {}   # row -> color
+
+        for r in range(R):
+            for c in range(C):
+                v = inp[r][c]
+                if v == bg_c:
+                    continue
+                # Left-edge or right-edge cells (any row)
+                if c == 0:
+                    if r in left_cells:
+                        return None
+                    left_cells[r] = v
+                elif c == C - 1:
+                    if r in right_cells:
+                        return None
+                    right_cells[r] = v
+                else:
+                    return None   # unexpected non-bg cell
+
+        # Need at least one row with both markers
+        paired = set(left_cells) & set(right_cells)
+        if not paired:
+            return None
+        # All left and right cells must be paired
+        if paired != set(left_cells) or paired != set(right_cells):
+            return None
+
+        out = [row[:] for row in inp]
+        for r in paired:
+            lc = left_cells[r]
+            rc = right_cells[r]
+            for c in range(mid_col):
+                out[r][c] = lc
+            out[r][mid_col] = 5          # midpoint junction color
+            for c in range(mid_col + 1, C):
+                out[r][c] = rc
+        return out
+
+    def learn(self, pairs):
+        self._ok = False
+        if not pairs:
+            return
+        ok = sum(1 for p in pairs
+                 if self._build(p['input']) is not None
+                 and self._build(p['input']) == p['output'])
+        if ok == len(pairs):
+            self._ok = True
+            self._conf = 0.91
+
+    def confidence(self):
+        return self._conf
+
+    def apply(self, test_input):
+        if not self._ok:
+            return None
+        return self._build(test_input)
+
 
 ALL_SOLVER_CLASSES = [
     NeighborhoodRuleLearner,
@@ -1822,6 +2488,12 @@ ALL_SOLVER_CLASSES = [
     SeparatorZoneFillSolver,
     EmbeddedPatternExtractSolver,
     AngularConcaveFillSolver,
+    BoundingBoxEnclosureReplaceSolver,
+    GridSectionThresholdFillSolver,
+    LPathConnectorSolver,
+    PeriodicStripeRepeatSolver,
+    CrossIntersectionFillSolver,
+    MeetInMiddleSolver,
 ]
 
 # Composite combinations
