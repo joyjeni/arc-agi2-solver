@@ -96,7 +96,9 @@ def run_benchmark(tasks: dict) -> dict:
         # ── Stage 2: pattern induction engine ────────────────────────────────
         prediction = None
         try:
-            prediction = solve_task_pattern(train_pairs, test_input)
+            result = solve_task_pattern(train_pairs, test_input)
+            # solve_task returns (grid, solver_name, confidence) tuple
+            prediction = result[0] if (isinstance(result, tuple) and len(result) >= 1) else result
         except Exception as exc:
             per_task[task_id] = {"stage": "error_s2", "error": str(exc)[:120]}
             errors += 1
