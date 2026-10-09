@@ -2715,6 +2715,231 @@ class GridSectionColorFillSolver(BaseSolver):
 
 
 
+# ── NEW SOLVERS v5 ──────────────────────────────────────────────────────────
+
+class RotationalSymmetryCompletionSolver(BaseSolver):
+    """
+    Completes a grid by enforcing 4-fold (90°) rotational symmetry around
+    the centroid of non-background cells.
+    """
+    name = "RotationalSymmetryCompletionSolver"
+
+    def __init__(self):
+        super().__init__()
+        self._conf = 0.0
+
+    def _complete(self, grid):
+        R = len(grid)
+        if R == 0:
+            return None
+        C = len(grid[0])
+        bg_col = bg(grid)
+
+        rows_nb = [r for r in range(R) for c in range(C) if grid[r][c] != bg_col]
+        cols_nb = [c for r in range(R) for c in range(C) if grid[r][c] != bg_col]
+        if not rows_nb:
+            return [row[:] for row in grid]
+
+        # Centre as float (may be .0 or .5)
+        cy = (min(rows_nb) + max(rows_nb)) / 2.0
+        cx = (min(cols_nb) + max(cols_nb)) / 2.0
+
+        result = [row[:] for row in grid]
+
+        # Iteratively propagate until stable (handles sparse seeds)
+        changed = True
+        while changed:
+            changed = False
+            for r in range(R):
+                for c in range(C):
+                    if result[r][c] == bg_col:
+                        continue
+                    color = result[r][c]
+                    dr = r - cy
+                    dc = c - cx
+                    # 4 positions under successive 90° CW rotations
+                    rotations = [
+                        (cy + dc, cx - dr),
+                        (cy - dr, cx - dc),
+                        (cy - dc, cx + dr),
+                    ]
+                    for pr, pc in rotations:
+                        pri = round(pr)
+                        pci = round(pc)
+                        if 0 <= pri < R and 0 <= pci < C and result[pri][pci] == bg_col:
+                            result[pri][pci] = color
+                            changed = True
+        return result
+
+    def learn(self, train_pairs):
+        if not train_pairs:
+            self._conf = 0.0
+            return
+        ok = 0
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            if len(inp) != len(out) or (inp and len(inp[0]) != len(out[0])):
+                continue
+            pred = self._complete(inp)
+            if pred == out:
+                ok += 1
+        self._conf = 1.001 if ok == len(train_pairs) else ok / len(train_pairs)
+
+    def apply(self, test_input):
+        return self._complete(test_input)
+
+
+class PointSymmetry2Filler(BaseSolver):
+    """
+    Detects and completes partially-symmetric grids using 180-degree
+    point symmetry. Each pair may have a different symmetry centre;
+    the centre is inferred per-input by maximising already-paired cells.
+    """
+    name = "PointSymmetry2Filler"
+
+    def __init__(self):
+        super().__init__()
+        self._conf = 0.0
+        self._fill_color = None
+        self._source_color = None
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _detect_added_color(train_pairs):
+        """Return the single new colour that appears in outputs but not inputs."""
+        added = {}
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            R = len(inp)
+            if not R or len(out) != R:
+                continue
+            C = len(inp[0])
+            if not C or len(out[0]) != C:
+                continue
+            for r in range(R):
+                for c in range(C):
+                    if inp[r][c] != out[r][c]:
+                        v = out[r][c]
+                        added[v] = added.get(v, 0) + 1
+        return list(added.keys())[0] if len(added) == 1 else None
+
+    @staticmethod
+    def _main_fg_color(grid, exclude):
+        from collections import Counter
+        ctr = Counter()
+        bg_col = bg(grid)
+        for row in grid:
+            for v in row:
+                if v != bg_col and v not in exclude:
+                    ctr[v] += 1
+        return ctr.most_common(1)[0][0] if ctr else None
+
+    @staticmethod
+    def _find_center(grid, source_color):
+        """
+        Find the integer-or-half-integer 180° symmetry centre that maximises
+        already-paired source cells (no conflicts, at least one cell to fill).
+        Returns (cr, cc) or None.
+        """
+        R = len(grid)
+        C = len(grid[0]) if R else 0
+        src_cells = [(r, c) for r in range(R) for c in range(C) if grid[r][c] == source_color]
+        if not src_cells:
+            return None
+        best, best_score = None, (-1, 0)
+        for cr2 in range(2 * R - 1):
+            for cc2 in range(2 * C - 1):
+                paired = unpaired = conflict = 0
+                for (r, c) in src_cells:
+                    mr, mc = cr2 - r, cc2 - c
+                    if 0 <= mr < R and 0 <= mc < C:
+                        mv = grid[mr][mc]
+                        if mv == source_color:
+                            paired += 1
+                        elif mv == 0:
+                            unpaired += 1
+                        else:
+                            conflict += 1
+                    else:
+                        conflict += 1
+                if conflict == 0 and unpaired > 0:
+                    score = (paired, -unpaired)
+                    if score > best_score:
+                        best_score = score
+                        best = (cr2 / 2.0, cc2 / 2.0)
+        return best
+
+    @staticmethod
+    def _apply_sym(grid, cr, cc, source_color, fill_color):
+        """For each source cell whose 180°-mirror is empty, fill with fill_color."""
+        R = len(grid)
+        C = len(grid[0]) if R else 0
+        cr2, cc2 = int(round(2 * cr)), int(round(2 * cc))
+        result = [row[:] for row in grid]
+        for r in range(R):
+            for c in range(C):
+                if grid[r][c] != source_color:
+                    continue
+                mr, mc = cr2 - r, cc2 - c
+                if 0 <= mr < R and 0 <= mc < C and result[mr][mc] == 0:
+                    result[mr][mc] = fill_color
+        return result
+
+    # ── learn / apply ─────────────────────────────────────────────────────────
+
+    def learn(self, train_pairs):
+        if not train_pairs:
+            self._conf = 0.0
+            return
+
+        fill_color = self._detect_added_color(train_pairs)
+        if fill_color is None:
+            self._conf = 0.0
+            return
+
+        source_color = self._main_fg_color(train_pairs[0]['input'], {fill_color})
+        if source_color is None:
+            self._conf = 0.0
+            return
+
+        ok = 0
+        for p in train_pairs:
+            inp, out = p['input'], p['output']
+            R = len(inp)
+            if not R or len(out) != R:
+                continue
+            C = len(inp[0])
+            if not C or len(out[0]) != C:
+                continue
+            center = self._find_center(inp, source_color)
+            if center is None:
+                continue
+            pred = self._apply_sym(inp, center[0], center[1], source_color, fill_color)
+            if pred == out:
+                ok += 1
+
+        self._fill_color = fill_color
+        self._source_color = source_color
+        self._conf = ok / len(train_pairs)
+
+    def apply(self, test_input):
+        if self._fill_color is None or self._source_color is None:
+            return None
+        R = len(test_input)
+        if not R:
+            return None
+        C = len(test_input[0])
+        if not C:
+            return None
+        center = self._find_center(test_input, self._source_color)
+        if center is None:
+            return None
+        return self._apply_sym(test_input, center[0], center[1],
+                               self._source_color, self._fill_color)
+
+
+
 ALL_SOLVER_CLASSES = [
     NeighborhoodRuleLearner,
     BilateralSymmetrySolver,
@@ -2750,6 +2975,8 @@ ALL_SOLVER_CLASSES = [
     PixelRowColFillSolver,
     CrossFillIntersectSolver,
     GridSectionColorFillSolver,
+    RotationalSymmetryCompletionSolver,
+    PointSymmetry2Filler,
 ]
 
 # Composite combinations
