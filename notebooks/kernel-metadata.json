@@ -1,6 +1,6 @@
 {
-  "id": "arc-agi2-solver",
-  "title": "ARC-AGI-2 Solver — Three-Stage Pipeline",
+  "id": "joyjeni/arc-agi2-solver",
+  "title": "ARC-AGI-2 Solver \u2014 Three-Stage Pipeline",
   "code_file": "arc_agi2_submission.ipynb",
   "language": "python",
   "kernel_type": "notebook",
